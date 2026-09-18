@@ -9,13 +9,16 @@ const GamesDatastore = DefineDatastore({
     player2: { type: Schema.types.string },
     sets: { type: Schema.types.string },
     winner: { type: Schema.types.string },
+    // Slack datastore schemas are additive-only; these legacy fields are no longer written.
     player1_elo_before: { type: Schema.types.number },
     player2_elo_before: { type: Schema.types.number },
     player1_elo_after: { type: Schema.types.number },
     player2_elo_after: { type: Schema.types.number },
     recorded_by: { type: Schema.types.string },
     channel: { type: Schema.types.string },
+    message_ts: { type: Schema.types.string },
     created_at: { type: Schema.types.string },
+    updated_at: { type: Schema.types.string },
   },
 });
 

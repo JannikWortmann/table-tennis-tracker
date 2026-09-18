@@ -23,6 +23,9 @@ const appMentionedTrigger: Trigger<
     channel_id: { value: TriggerContextData.Event.AppMentioned.channel_id },
     user_id: { value: TriggerContextData.Event.AppMentioned.user_id },
     message_text: { value: TriggerContextData.Event.AppMentioned.text },
+    message_ts: {
+      value: TriggerContextData.Event.AppMentioned.event_timestamp,
+    },
   },
 };
 
