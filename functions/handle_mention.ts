@@ -2,7 +2,15 @@ import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 import { APP_CONFIG } from "../config.ts";
 import GamesDatastore from "../datastores/games.ts";
 import PlayerRatingsDatastore from "../datastores/player_ratings.ts";
-import { DEFAULT_RATING, updateRatings } from "../lib/elo.ts";
+import { DEFAULT_RATING } from "../lib/elo.ts";
+import { classifyGameSubmission } from "../lib/game_submission.ts";
+import {
+  buildRatingProjection,
+  determineMatchWinner,
+  type GameRatingSnapshot,
+  type GameRecord,
+  type SetScore,
+} from "../lib/rating_projection.ts";
 
 interface PlayerRatingItem {
   id: string;
@@ -11,9 +19,11 @@ interface PlayerRatingItem {
   losses: number;
   draws: number;
   games_played: number;
+  nemeses?: string;
+  nemesis_losses?: number;
 }
 
-interface DatastoreQueryResult {
+interface PlayerRatingsQueryResult {
   ok: boolean;
   error?: string;
   items: PlayerRatingItem[];
@@ -21,6 +31,17 @@ interface DatastoreQueryResult {
     next_cursor?: string;
   };
 }
+
+interface GamesQueryResult {
+  ok: boolean;
+  error?: string;
+  items: GameDatastoreItem[];
+  response_metadata?: {
+    next_cursor?: string;
+  };
+}
+
+type GameDatastoreItem = GameRecord;
 
 type FunctionResult = { outputs: Record<string, never> } | { error: string };
 
@@ -33,19 +54,15 @@ export const HandleMentionFunction = DefineFunction({
       channel_id: { type: Schema.types.string },
       user_id: { type: Schema.types.string },
       message_text: { type: Schema.types.string },
+      message_ts: { type: Schema.types.string },
     },
-    required: ["channel_id", "user_id", "message_text"],
+    required: ["channel_id", "user_id", "message_text", "message_ts"],
   },
   output_parameters: {
     properties: {},
     required: [],
   },
 });
-
-interface SetScore {
-  p1: number;
-  p2: number;
-}
 
 function parseMessage(text: string): {
   type: "game" | "leaderboard" | "unknown";
@@ -91,50 +108,6 @@ function isValidSet(s: SetScore): boolean {
   return winner - loser === 2;
 }
 
-function determineMatchWinner(
-  player1: string,
-  player2: string,
-  sets: SetScore[],
-): { outcome: "player1" | "player2" | "draw"; winner: string | null } {
-  let p1Wins = 0;
-  let p2Wins = 0;
-  for (const s of sets) {
-    if (s.p1 > s.p2) p1Wins++;
-    else p2Wins++;
-  }
-  if (p1Wins === p2Wins) return { outcome: "draw", winner: null };
-  return p1Wins > p2Wins
-    ? { outcome: "player1", winner: player1 }
-    : { outcome: "player2", winner: player2 };
-}
-
-async function getPlayerRating(
-  // deno-lint-ignore no-explicit-any
-  client: any,
-  userId: string,
-): Promise<{
-  rating: number;
-  wins: number;
-  losses: number;
-  draws: number;
-  games: number;
-}> {
-  const result = await client.apps.datastore.get({
-    datastore: PlayerRatingsDatastore.name,
-    id: userId,
-  });
-  if (result.ok && result.item?.id) {
-    return {
-      rating: result.item.rating ?? DEFAULT_RATING,
-      wins: result.item.wins ?? 0,
-      losses: result.item.losses ?? 0,
-      draws: result.item.draws ?? 0,
-      games: result.item.games_played ?? 0,
-    };
-  }
-  return { rating: DEFAULT_RATING, wins: 0, losses: 0, draws: 0, games: 0 };
-}
-
 export default SlackFunction(
   HandleMentionFunction,
   async ({ inputs, client }) => {
@@ -149,6 +122,7 @@ export default SlackFunction(
           client,
           channel_id,
           inputs.user_id,
+          inputs.message_ts,
           parsed.player1!,
           parsed.player2!,
           parsed.sets!,
@@ -182,7 +156,7 @@ async function handleLeaderboard(
     const result = await client.apps.datastore.query({
       datastore: PlayerRatingsDatastore.name,
       cursor,
-    }) as DatastoreQueryResult;
+    }) as PlayerRatingsQueryResult;
     if (!result.ok) {
       await client.chat.postMessage({
         channel: channelId,
@@ -214,7 +188,13 @@ async function handleLeaderboard(
     const w = p.wins ?? 0;
     const l = p.losses ?? 0;
     const d = p.draws ?? 0;
-    return `${rank} <@${p.id}> — *${rating}* ELO (${w}W / ${l}L / ${d}D)`;
+    const nemeses = parseNemeses(p.nemeses);
+    const nemesis = nemeses.length > 0
+      ? `${nemeses.map((id) => `<@${id}>`).join(", ")} (${
+        p.nemesis_losses ?? 0
+      }L)`
+      : "none yet";
+    return `${rank} <@${p.id}> — *${rating}* ELO (${w}W / ${l}L / ${d}D) — Nemesis: ${nemesis}`;
   });
 
   await client.chat.postMessage({
@@ -230,6 +210,7 @@ async function handleGame(
   client: any,
   channelId: string,
   recordedBy: string,
+  messageTs: string,
   player1: string,
   player2: string,
   sets: SetScore[],
@@ -253,93 +234,190 @@ async function handleGame(
     }
   }
 
-  const { outcome, winner } = determineMatchWinner(player1, player2, sets);
-
-  const p1Stats = await getPlayerRating(client, player1);
-  const p2Stats = await getPlayerRating(client, player2);
-
-  const { newRating1, newRating2 } = updateRatings(
-    p1Stats.rating,
-    p2Stats.rating,
-    outcome,
+  const allGames = await queryAllGames(client);
+  const submission = classifyGameSubmission(
+    allGames,
+    channelId,
+    messageTs,
+    player1,
+    player2,
+    sets,
   );
 
-  const gameId = crypto.randomUUID();
+  if (submission.kind === "edit") {
+    await client.chat.postMessage({
+      channel: channelId,
+      text:
+        ":x: This score was already recorded and old scores cannot be modified. Post a new message to record a separate game.",
+    });
+    return { outputs: {} };
+  }
+
+  if (submission.kind === "redelivery") {
+    const rebuilt = await rebuildRatings(client, allGames, submission.game.id);
+    if ("error" in rebuilt) return rebuilt;
+    return { outputs: {} };
+  }
+
   const now = new Date().toISOString();
+  const gameId = crypto.randomUUID();
+  const { winner } = determineMatchWinner(player1, player2, sets);
+  const gameItem: GameRecord = {
+    id: gameId,
+    player1,
+    player2,
+    sets: JSON.stringify(sets),
+    winner,
+    recorded_by: recordedBy,
+    channel: channelId,
+    message_ts: messageTs,
+    created_at: now,
+  };
 
   const putGame = await client.apps.datastore.put({
     datastore: GamesDatastore.name,
-    item: {
-      id: gameId,
-      player1,
-      player2,
-      sets: JSON.stringify(sets),
-      winner: winner ?? "",
-      player1_elo_before: p1Stats.rating,
-      player2_elo_before: p2Stats.rating,
-      player1_elo_after: newRating1,
-      player2_elo_after: newRating2,
-      recorded_by: recordedBy,
-      channel: channelId,
-      created_at: now,
-    },
+    item: gameItem,
   });
 
   if (!putGame.ok) {
     return { error: `Failed to save game: ${putGame.error}` };
   }
 
-  const putP1 = await client.apps.datastore.put({
-    datastore: PlayerRatingsDatastore.name,
-    item: {
-      id: player1,
-      rating: newRating1,
-      wins: p1Stats.wins + (outcome === "player1" ? 1 : 0),
-      losses: p1Stats.losses + (outcome === "player2" ? 1 : 0),
-      draws: p1Stats.draws + (outcome === "draw" ? 1 : 0),
-      games_played: p1Stats.games + 1,
-    },
-  });
+  const gamesForRebuild = allGames.concat(gameItem);
+  const rebuilt = await rebuildRatings(client, gamesForRebuild, gameId);
+  if ("error" in rebuilt) return rebuilt;
 
-  if (!putP1.ok) {
-    return { error: `Failed to update player 1 rating: ${putP1.error}` };
-  }
-
-  const putP2 = await client.apps.datastore.put({
-    datastore: PlayerRatingsDatastore.name,
-    item: {
-      id: player2,
-      rating: newRating2,
-      wins: p2Stats.wins + (outcome === "player2" ? 1 : 0),
-      losses: p2Stats.losses + (outcome === "player1" ? 1 : 0),
-      draws: p2Stats.draws + (outcome === "draw" ? 1 : 0),
-      games_played: p2Stats.games + 1,
-    },
-  });
-
-  if (!putP2.ok) {
-    return { error: `Failed to update player 2 rating: ${putP2.error}` };
-  }
+  const rebuiltGame = rebuilt.game;
 
   const setsDisplay = sets.map((s) => `\`${s.p1}-${s.p2}\``).join("  ");
-  const p1Delta = newRating1 - p1Stats.rating;
-  const p2Delta = newRating2 - p2Stats.rating;
+  const p1Delta = rebuiltGame.player1_elo_after -
+    rebuiltGame.player1_elo_before;
+  const p2Delta = rebuiltGame.player2_elo_after -
+    rebuiltGame.player2_elo_before;
   const sign = (n: number) => (n >= 0 ? `+${n}` : `${n}`);
   const resultLine = winner
     ? `:trophy: Winner: <@${winner}>`
     : `:handshake: Draw!`;
-
   await client.chat.postMessage({
     channel: channelId,
     text: `:table_tennis_paddle_and_ball: *Game Recorded!*\n\n` +
       `<@${player1}> vs <@${player2}>: ${setsDisplay}\n` +
       `${resultLine}\n\n` +
       `*ELO Updates:*\n` +
-      `• <@${player1}>: ${p1Stats.rating} → ${newRating1} (${
+      `• <@${player1}>: ${rebuiltGame.player1_elo_before} → ${rebuiltGame.player1_elo_after} (${
         sign(p1Delta)
       })\n` +
-      `• <@${player2}>: ${p2Stats.rating} → ${newRating2} (${sign(p2Delta)})`,
+      `• <@${player2}>: ${rebuiltGame.player2_elo_before} → ${rebuiltGame.player2_elo_after} (${
+        sign(p2Delta)
+      })`,
   });
 
   return { outputs: {} };
+}
+
+async function queryAllGames(
+  // deno-lint-ignore no-explicit-any
+  client: any,
+): Promise<GameDatastoreItem[]> {
+  const items: GameDatastoreItem[] = [];
+  let cursor: string | undefined = undefined;
+
+  do {
+    const result = await client.apps.datastore.query({
+      datastore: GamesDatastore.name,
+      cursor,
+    }) as GamesQueryResult;
+    if (!result.ok) {
+      throw new Error(`Failed to fetch games: ${result.error}`);
+    }
+    cursor = result.response_metadata?.next_cursor;
+    items.push(...result.items);
+  } while (cursor);
+
+  return items;
+}
+
+async function queryAllPlayerRatings(
+  // deno-lint-ignore no-explicit-any
+  client: any,
+): Promise<PlayerRatingItem[]> {
+  const items: PlayerRatingItem[] = [];
+  let cursor: string | undefined = undefined;
+
+  do {
+    const result = await client.apps.datastore.query({
+      datastore: PlayerRatingsDatastore.name,
+      cursor,
+    }) as PlayerRatingsQueryResult;
+    if (!result.ok) {
+      throw new Error(`Failed to fetch player ratings: ${result.error}`);
+    }
+    cursor = result.response_metadata?.next_cursor;
+    items.push(...result.items);
+  } while (cursor);
+
+  return items;
+}
+
+async function rebuildRatings(
+  // deno-lint-ignore no-explicit-any
+  client: any,
+  games: GameRecord[],
+  gameId: string,
+): Promise<{ game: GameRatingSnapshot } | { error: string }> {
+  const projection = buildRatingProjection(games);
+  const existingRatings = await queryAllPlayerRatings(client);
+  const projectedRatings = new Map(
+    projection.ratings.map((rating) => [rating.id, rating]),
+  );
+
+  for (const existingRating of existingRatings) {
+    if (!projectedRatings.has(existingRating.id)) {
+      const deleteRating = await client.apps.datastore.delete({
+        datastore: PlayerRatingsDatastore.name,
+        id: existingRating.id,
+      });
+      if (!deleteRating.ok) {
+        return {
+          error:
+            `Failed to remove stale rating for ${existingRating.id}: ${deleteRating.error}`,
+        };
+      }
+    }
+  }
+
+  for (const rating of projectedRatings.values()) {
+    const putRating = await client.apps.datastore.put({
+      datastore: PlayerRatingsDatastore.name,
+      item: {
+        ...rating,
+        nemeses: JSON.stringify(rating.nemeses),
+      },
+    });
+    if (!putRating.ok) {
+      return {
+        error: `Failed to rebuild rating for ${rating.id}: ${putRating.error}`,
+      };
+    }
+  }
+
+  const updatedGame = projection.games.find((game) => game.id === gameId);
+
+  if (!updatedGame) {
+    return { error: "Failed to rebuild the saved game" };
+  }
+
+  return { game: updatedGame };
+}
+
+function parseNemeses(value: string | undefined): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.every((id) => typeof id === "string")
+      ? parsed
+      : [];
+  } catch {
+    return [];
+  }
 }

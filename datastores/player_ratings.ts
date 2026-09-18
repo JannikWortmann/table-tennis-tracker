@@ -10,6 +10,8 @@ const PlayerRatingsDatastore = DefineDatastore({
     losses: { type: Schema.types.number },
     draws: { type: Schema.types.number },
     games_played: { type: Schema.types.number },
+    nemeses: { type: Schema.types.string },
+    nemesis_losses: { type: Schema.types.number },
   },
 });
 

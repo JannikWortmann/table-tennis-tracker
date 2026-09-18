@@ -3,7 +3,9 @@
 A Slack app that tracks table tennis games and ELO rankings. Mention
 **@PingPong** in any channel to record games and view the leaderboard.
 
-It's a fun way to keep track of office rivalaries in various sports like table soccer ⚽️, ping pong 🏓 or tennis 🎾. The bot is easily adjustable to suit the counting scheme of the corresponding sport.
+It's a fun way to keep track of office rivalaries in various sports like table
+soccer ⚽️, ping pong 🏓 or tennis 🎾. The bot is easily adjustable to suit the
+counting scheme of the corresponding sport.
 
 ## Usage
 
@@ -27,21 +29,30 @@ who wins the majority of sets wins the match.
 All players start at **1000 ELO** with a K-factor of 32. A weekly leaderboard is
 also posted automatically every Monday at 9 AM (Europe/Berlin).
 
+Recorded games are immutable. Editing an already recorded score is rejected;
+post a new score message to record another game. Ratings and player statistics
+are freshly recalculated from the complete game history after every new game.
+The on-demand leaderboard also shows each player's nemesis: every opponent they
+have lost against most often.
+
 ---
 
 ## Installation
- 
+
 > You need a Slack workspace on [a paid plan](https://slack.com/pricing) and the
-[Slack CLI](https://api.slack.com/automation/quickstart) installed.
+> [Slack CLI](https://api.slack.com/automation/quickstart) installed.
 
 1. Install and authenticate the Slack CLI for the workspace that will host the
    app.
 2. Clone this repository
+
 ```
 git clone https://github.com/JannikWortmann/table-tennis-tracker && cd table-tennis-tracker
 ```
-3. Adjust `config.ts` to use a channel ID from your
-   workspace. The channel must be accessible to the app.
+
+3. Adjust `config.ts` to use a channel ID from your workspace. The channel must
+   be accessible to the app.
+
 ```ts
 export const APP_CONFIG = {
   app: {
@@ -122,9 +133,9 @@ $ slack deploy
 
 ### `datastores/`
 
-- **`games.ts`** — Stores game history (players, set scores, ELO changes).
-- **`player_ratings.ts`** — Stores per-player ELO rating, wins, losses, draws,
-  and games played.
+- **`games.ts`** — Stores immutable game history and source-message metadata.
+- **`player_ratings.ts`** — Stores recalculated per-player ELO ratings,
+  statistics, and nemeses.
 
 ### `lib/`
 
